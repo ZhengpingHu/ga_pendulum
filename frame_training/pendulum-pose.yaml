@@ -1,0 +1,10 @@
+path: . 
+
+train: pendulum_dataset/images/train
+val: pendulum_dataset/images/val
+
+kpt_shape: [2, 3] 
+flip_idx: []
+
+names:
+  0: pendulum
