@@ -14,7 +14,7 @@ from tqdm import tqdm
 import pandas as pd
 import time
 
-# 绘图
+# 绘图库
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -35,7 +35,9 @@ def set_global_seed(seed: int):
 class PendulumNNPolicy(nn.Module):
     def __init__(self):
         super().__init__()
-        # 4输入 -> 16隐藏 -> 1输出(Tanh) -> 放大2倍
+        # Input: 4 (Tip_x, Tip_y, V_x, V_y)
+        # Hidden: 16 (增加隐藏层以处理非线性Swing-up)
+        # Output: 1 (Torque)
         self.net = nn.Sequential(
             nn.Linear(4, 16),
             nn.ReLU(),
@@ -43,6 +45,7 @@ class PendulumNNPolicy(nn.Module):
             nn.Tanh()
         )
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Pendulum 力矩范围 [-2, 2]
         return self.net(x) * 2.0
 
 # 基因操作
@@ -60,27 +63,52 @@ def uniform_crossover(p1, p2):
     return np.where(mask, p1, p2), np.where(~mask, p1, p2)
 
 # ==========================================
-# 2. 种子库管理
+# 2. 种子库管理 (含修复后的 update_and_refresh)
 # ==========================================
 class SeedPortfolioManager:
-    def __init__(self, pool_size, subset_k):
+    def __init__(self, pool_size, subset_k, max_age=10):
         self.master_pool = [2025 + i for i in range(pool_size)]
         self.subset_k = subset_k
+        self.max_age = max_age
+        
+        # 随机初始化
         self.active_subset = random.sample(self.master_pool, self.subset_k)
-        print(f"🌱 Initial subset: {self.active_subset}")
+        # 记录年龄
+        self.active_ages = {seed: 0 for seed in self.active_subset}
+        
+        print(f"🌱 Initial subset: {self.active_subset} (Max Age: {self.max_age})")
 
     def get_active_subset(self): return self.active_subset
 
     def update_and_refresh(self, results_matrix: np.ndarray, refresh_rate: float):
-        # 计算每个种子的总得分 (Column Sum)
+        """
+        修复版逻辑：确保字典键值对同步，防止 KeyError
+        """
+        # 1. 所有种子年龄 +1
+        for s in self.active_subset:
+            # 安全自增，防止极少数情况下的 Key 丢失
+            self.active_ages[s] = self.active_ages.get(s, 0) + 1
+            
+        # 2. 找出因寿命到期需要退休的种子
+        seeds_to_retire = {s for s, age in self.active_ages.items() if age >= self.max_age}
+        
+        # 3. 找出因表现太差(太难)需要淘汰的种子
         seed_scores = results_matrix.sum(axis=0)
         sorted_indices = np.argsort(seed_scores) # 低分在前
         
-        num_replace = int(self.subset_k * refresh_rate)
-        if num_replace == 0: return
+        num_perf_replace = int(self.subset_k * refresh_rate)
+        indices_perf = sorted_indices[:num_perf_replace]
+        seeds_perf_replace = {self.active_subset[i] for i in indices_perf}
+        
+        # 4. 合并淘汰列表
+        seeds_to_remove = seeds_to_retire.union(seeds_perf_replace)
+        
+        if not seeds_to_remove: return
 
-        # 替换最难的 (分数最低的)
-        indices_to_replace = sorted_indices[:num_replace]
+        # 5. 准备新种子
+        num_replace = len(seeds_to_remove)
+        
+        # 找出可用新种子 (在主池里，且不在当前活跃列表里)
         available = [s for s in self.master_pool if s not in self.active_subset]
         
         if len(available) < num_replace:
@@ -88,12 +116,37 @@ class SeedPortfolioManager:
         else:
             new_seeds = random.sample(available, num_replace)
             
-        for i, idx in enumerate(indices_to_replace):
-            self.active_subset[idx] = new_seeds[i]
+        # --- [关键修复逻辑] ---
+        
+        # A. 从字典中彻底删除要移除的种子 (无论它是否会被重新选回，先删为敬)
+        for s in seeds_to_remove:
+            if s in self.active_ages:
+                del self.active_ages[s]
+                
+        # B. 构建新的活跃列表 (移除旧的)
+        current_seeds = [s for s in self.active_subset if s not in seeds_to_remove]
+        
+        # C. 添加新种子并初始化年龄
+        for new_s in new_seeds:
+            current_seeds.append(new_s)
+            self.active_ages[new_s] = 0 # 重置年龄
+            
+        # D. 确保列表长度对齐 (裁切或补齐)
+        self.active_subset = current_seeds[:self.subset_k]
+        
+        # E. 最终容错：如果因为某种原因列表短了，补齐
+        while len(self.active_subset) < self.subset_k:
+            extra = random.choice(self.master_pool)
+            if extra not in self.active_subset:
+                self.active_subset.append(extra)
+                self.active_ages[extra] = 0
 
-    # 用于保存 Checkpoint
     def state_dict(self):
-        return {"master_pool": self.master_pool, "active_subset": self.active_subset}
+        return {
+            "master_pool": self.master_pool, 
+            "active_subset": self.active_subset,
+            "active_ages": self.active_ages
+        }
 
 # ==========================================
 # 3. 评估与通信
@@ -148,15 +201,11 @@ def calculate_fitness_sharing(results_matrix: np.ndarray) -> np.ndarray:
     return shared_matrix.sum(axis=1)
 
 # ==========================================
-# 4. 日志与 Checkpoint (核心修改)
+# 4. 日志与 Checkpoint
 # ==========================================
 def save_detailed_logs(run_dir, gen, results_matrix, fitness_scores, subset_seeds):
-    """
-    保存这一代每个个体、在每个种子下的详细表现。
-    """
     records = []
     pop_size, num_seeds = results_matrix.shape
-    
     for i in range(pop_size):
         for j in range(num_seeds):
             records.append({
@@ -164,47 +213,37 @@ def save_detailed_logs(run_dir, gen, results_matrix, fitness_scores, subset_seed
                 "individual_id": i,
                 "seed_value": subset_seeds[j],
                 "reward": results_matrix[i, j],
-                "shared_fitness": fitness_scores[i] # 共享Fitness是个体的属性
+                "shared_fitness": fitness_scores[i]
             })
-            
     df = pd.DataFrame(records)
-    # 追加模式写入 (如果文件不存在则创建头)
     log_path = os.path.join(run_dir, "detailed_history.csv")
     write_header = not os.path.exists(log_path)
     df.to_csv(log_path, mode='a', header=write_header, index=False)
 
 def save_checkpoint(run_dir, gen, population, portfolio):
-    """
-    保存完整的训练现场 (种群权重 + 种子库状态)
-    """
     ckpt_dir = os.path.join(run_dir, "checkpoints")
     os.makedirs(ckpt_dir, exist_ok=True)
-    
     filename = os.path.join(ckpt_dir, f"checkpoint_gen_{gen:04d}.npz")
     np.savez_compressed(
         filename,
         generation=gen,
-        population=np.array(population), # 保存所有个体的权重
-        portfolio_state=portfolio.state_dict() # 保存种子库状态
+        population=np.array(population),
+        portfolio_state=portfolio.state_dict()
     )
-    # print(f"💾 Checkpoint saved: {filename}")
 
 def plot_dual_axis(run_dir, df):
     fig, ax1 = plt.subplots(figsize=(10, 6))
     c1 = 'tab:purple'; c2 = 'tab:green'
-    
     ax1.set_xlabel('Gen')
     ax1.set_ylabel('Shared Fitness', color=c1)
     ax1.plot(df['gen'], df['best_fitness'], color=c1, label='Best Fitness')
     ax1.tick_params(axis='y', labelcolor=c1)
     ax1.grid(True, alpha=0.3)
-    
     ax2 = ax1.twinx()
     ax2.set_ylabel('Raw Reward', color=c2)
     ax2.plot(df['gen'], df['max_raw_reward'], color=c2, linestyle='--', label='Max Reward')
     ax2.plot(df['gen'], df['avg_raw_reward'], color='gray', linestyle=':', label='Avg Reward')
     ax2.tick_params(axis='y', labelcolor=c2)
-    
     plt.title("Evolution Process")
     fig.tight_layout()
     plt.savefig(os.path.join(run_dir, "plot_metrics.png")); plt.close()
@@ -227,7 +266,7 @@ def run_ga(args):
     os.makedirs(run_dir, exist_ok=True)
     
     # 初始化
-    portfolio = SeedPortfolioManager(pool_size=100, subset_k=args.subset_k)
+    portfolio = SeedPortfolioManager(pool_size=100, subset_k=args.subset_k, max_age=args.max_seed_age)
     model = PendulumNNPolicy()
     base_vec = get_weights_vector(model)
     pop = [mutate(base_vec, args.sigma) for _ in range(args.population)]
@@ -265,10 +304,8 @@ def run_ga(args):
         print(f"🏆 Gen {gen} | Fit: {best_fit:.2f} | MaxRaw: {gen_max:.1f} | Avg: {gen_avg:.1f}")
         
         # --- LOGGING & CHECKPOINTING ---
-        # 1. 保存详细数据 (CSV)
         save_detailed_logs(run_dir, gen, results_matrix, fit_scores, subset)
         
-        # 2. 保存指标概览 (CSV + Plot)
         history_metrics.append({
             "gen": gen, "best_fitness": best_fit, 
             "max_raw_reward": gen_max, "avg_raw_reward": gen_avg
@@ -278,11 +315,9 @@ def run_ga(args):
             df.to_csv(os.path.join(run_dir, "metrics_summary.csv"), index=False)
             plot_dual_axis(run_dir, df)
             
-        # 3. 定期保存完整 Checkpoint (每5代)
         if gen % 5 == 0:
             save_checkpoint(run_dir, gen, pop, portfolio)
             
-        # 4. 保存最佳模型 (Best so far)
         if gen_max > best_global_raw:
             best_global_raw = gen_max
             np.savez(os.path.join(run_dir, "best_model_running.npz"), weights=pop[np.argmax(fit_scores)])
@@ -332,13 +367,14 @@ if __name__ == "__main__":
     parser.add_argument("--processes", type=int, default=16)
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--sigma", type=float, default=0.1)
+    
+    # 种子与寿命参数
     parser.add_argument("--subset-k", type=int, default=5)
     parser.add_argument("--seed-refresh-rate", type=float, default=0.4)
+    parser.add_argument("--max-seed-age", type=int, default=10, help="Max seed lifespan")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed")
     
     args = parser.parse_args()
     
-    # 核心：设置全局种子
     set_global_seed(args.seed)
-    
     run_ga(args)
