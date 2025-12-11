@@ -1,0 +1,3 @@
+python pendulum_server.py
+
+python ga_pendulum.py --population 100 --generations 100 --subset-k 5 --seed-refresh-rate 0.4
