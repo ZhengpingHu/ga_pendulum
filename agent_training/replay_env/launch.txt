@@ -1,0 +1,3 @@
+python visualize_pendulum.py ./best_model_final_No_hidden.npz --hidden-size 0
+
+python visualize_pendulum.py ./best_model_final_16_hidden.npz --hidden-size 16

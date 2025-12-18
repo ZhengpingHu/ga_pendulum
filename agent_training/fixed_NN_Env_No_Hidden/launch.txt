@@ -1,1 +1,1 @@
-python ga_pendulum_direct.py --population 100 --generations 50 --processes 16 --sigma 0.1
+python ga_pendulum_direct.py --population 100 --generations 100 --processes 16 --sigma 0.1
